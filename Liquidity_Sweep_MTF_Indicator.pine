@@ -1,0 +1,385 @@
+//@version=6
+indicator("Liquidity Sweep Scalper [MTF -> 1m Entries]", shorttitle="LiqSweep MTF", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// =====================================================================================================
+// This indicator is designed to run on the 1-MINUTE chart.
+// It marks previous-candle liquidity levels from Daily / 1H / 15M / 5M timeframes, detects when one of
+// those levels is swept (wick through + close back inside) by a 1-minute candle (Step 1), then watches
+// for that 1-minute candle's own high/low to be swept (Step 2) to trigger a visual entry with an
+// auto-drawn Risk/Reward box, SL, and TP1/TP2/TP3. Re-entries (up to a max) fire automatically on the
+// next 1-minute candle whenever the previous SL is hit. Nothing here auto-executes trades - it is a
+// visual/decision-support tool. Every visual piece can be toggled off in Settings.
+// =====================================================================================================
+
+// ----------------------------------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------------------------------
+grp_tf     = "Higher-Timeframe Liquidity Levels"
+showDaily  = input.bool(true,  "Show Daily High/Low",   group = grp_tf)
+show1H     = input.bool(true,  "Show 1H Levels",        group = grp_tf)
+show15     = input.bool(true,  "Show 15M Levels",       group = grp_tf)
+show5      = input.bool(true,  "Show 5M Levels",        group = grp_tf)
+
+tf_daily   = input.timeframe("D",  "Daily TF string",  group = grp_tf, tooltip = "Change only if you want a different 'daily' definition.")
+tf_1h      = input.timeframe("60", "1H TF string",     group = grp_tf)
+tf_15      = input.timeframe("15", "15M TF string",    group = grp_tf)
+tf_5       = input.timeframe("5",  "5M TF string",     group = grp_tf)
+
+col_daily  = input.color(color.new(color.purple, 0), "Daily Color", group = grp_tf)
+col_1h     = input.color(color.new(color.blue,   0), "1H Color",    group = grp_tf)
+col_15     = input.color(color.new(color.teal,   0), "15M Color",   group = grp_tf)
+col_5      = input.color(color.new(color.orange, 0), "5M Color",    group = grp_tf)
+
+showTFLabels    = input.bool(true, "Show Timeframe Text on Lines", group = grp_tf)
+showSweptLevels = input.bool(true, "Keep Swept Levels Visible (greyed out)", group = grp_tf)
+maxLevelsPerTF  = input.int(4, "Max Levels Kept per Timeframe (each side)", minval = 1, maxval = 15, group = grp_tf, tooltip = "Older SWEPT levels get deleted first to keep the chart clean. Unswept (still active) levels are never auto-deleted.")
+lineWidth       = input.int(1, "Level Line Width", minval = 1, maxval = 4, group = grp_tf)
+
+grp_entry       = "Entry Logic (1-Minute)"
+minWickTicks    = input.float(0, "Min Sweep Wick Size (in ticks, 0 = off)", minval = 0, group = grp_entry, tooltip = "Filters out weak/insignificant sweeps ('good candle' filter). The wick beyond the level must be at least this many ticks for a Step 1 setup to arm. The level itself is still marked swept either way.")
+maxReentries    = input.int(3, "Max Entries per Liquidity Level", minval = 1, maxval = 10, group = grp_entry)
+slBufferTicks   = input.float(2, "SL Buffer (ticks beyond the sweep candle)", minval = 0, group = grp_entry)
+step2TimeoutBars= input.int(60, "Step 1 -> Step 2 Timeout (bars)", minval = 5, maxval = 500, group = grp_entry, tooltip = "If Step 2 (sweep of the Step-1 candle) never happens within this many 1-min bars, the setup is dropped so a fresh Step 1 can arm again.")
+
+grp_rr    = "Risk To Reward"
+rr1       = input.float(1.5, "TP1 (R multiple)", minval = 0.1, group = grp_rr)
+rr2       = input.float(2.5, "TP2 (R multiple)", minval = 0.1, group = grp_rr)
+rr3       = input.float(4.0, "TP3 (R multiple)", minval = 0.1, group = grp_rr)
+showRRBox = input.bool(true, "Show Risk/Reward Box + TP Lines", group = grp_rr)
+
+grp_disp   = "Markers"
+showStep1  = input.bool(true, "Show Step 1 (HTF Sweep) Markers", group = grp_disp)
+showStep2  = input.bool(true, "Show Step 2 / Entry Markers + Status Labels", group = grp_disp)
+
+// ----------------------------------------------------------------------------------------------------
+// TYPES
+// ----------------------------------------------------------------------------------------------------
+type LiqLevel
+    float level
+    bool  isHigh
+    bool  swept
+    line  ln
+    label lbl
+
+type SweepEvent
+    bool   happened
+    bool   isHigh
+    float  level
+    string tf
+
+type Setup
+    bool   active
+    bool   isShort
+    float  candleAHigh
+    float  candleALow
+    int    candleABar
+    string originTF
+    float  originLevel
+    int    entryCount
+    bool   awaitingReentry
+    float  entryPrice
+    float  slPrice
+    float  tp1
+    float  tp2
+    float  tp3
+    box    riskBox
+    box    rewardBox
+    line   tp2Line
+    line   tp3Line
+    label  infoLbl
+    label  tp2Lbl
+    label  tp3Lbl
+
+// ----------------------------------------------------------------------------------------------------
+// LEVEL STORAGE (per timeframe, per side)
+// ----------------------------------------------------------------------------------------------------
+var array<LiqLevel> dHighArr   = array.new<LiqLevel>()
+var array<LiqLevel> dLowArr    = array.new<LiqLevel>()
+var array<LiqLevel> h1HighArr  = array.new<LiqLevel>()
+var array<LiqLevel> h1LowArr   = array.new<LiqLevel>()
+var array<LiqLevel> m15HighArr = array.new<LiqLevel>()
+var array<LiqLevel> m15LowArr  = array.new<LiqLevel>()
+var array<LiqLevel> m5HighArr  = array.new<LiqLevel>()
+var array<LiqLevel> m5LowArr   = array.new<LiqLevel>()
+
+var Setup shortSetup = Setup.new(active = false, isShort = true,  candleAHigh = na, candleALow = na, candleABar = na, originTF = "", originLevel = na, entryCount = 0, awaitingReentry = false, entryPrice = na, slPrice = na, tp1 = na, tp2 = na, tp3 = na, riskBox = na, rewardBox = na, tp2Line = na, tp3Line = na, infoLbl = na, tp2Lbl = na, tp3Lbl = na)
+var Setup longSetup  = Setup.new(active = false, isShort = false, candleAHigh = na, candleALow = na, candleABar = na, originTF = "", originLevel = na, entryCount = 0, awaitingReentry = false, entryPrice = na, slPrice = na, tp1 = na, tp2 = na, tp3 = na, riskBox = na, rewardBox = na, tp2Line = na, tp3Line = na, infoLbl = na, tp2Lbl = na, tp3Lbl = na)
+
+// ----------------------------------------------------------------------------------------------------
+// FETCH HTF DATA (previous CLOSED candle's high/low, non-repainting)
+// ----------------------------------------------------------------------------------------------------
+f_htf(tf) =>
+    [h, l] = request.security(syminfo.tickerid, tf, [high[1], low[1]], lookahead = barmerge.lookahead_off)
+    [h, l]
+
+[dH, dL]     = f_htf(tf_daily)
+[h1H, h1L]   = f_htf(tf_1h)
+[m15H, m15L] = f_htf(tf_15)
+[m5H, m5L]   = f_htf(tf_5)
+
+// ----------------------------------------------------------------------------------------------------
+// LEVEL CREATION / PRUNING
+// ----------------------------------------------------------------------------------------------------
+f_addLevel(arr, lvl, isHighSide, tfText, col) =>
+    ln = line.new(x1 = bar_index, y1 = lvl, x2 = bar_index, y2 = lvl, color = col, width = lineWidth, extend = extend.none)
+    lbl = na
+    if showTFLabels
+        lbl := label.new(x = bar_index, y = lvl, text = tfText, style = isHighSide ? label.style_label_down : label.style_label_up, color = color.new(color.white, 100), textcolor = col, size = size.tiny)
+    newLvl = LiqLevel.new(level = lvl, isHigh = isHighSide, swept = false, ln = ln, lbl = lbl)
+    array.push(arr, newLvl)
+    if array.size(arr) > maxLevelsPerTF
+        for i = 0 to array.size(arr) - 1
+            lvl2 = array.get(arr, i)
+            if lvl2.swept
+                line.delete(lvl2.ln)
+                label.delete(lvl2.lbl)
+                array.remove(arr, i)
+                break
+
+f_updateLevels(curH, curL, highArr, lowArr, tfText, col, showTF) =>
+    var float prevH = na
+    var float prevL = na
+    if showTF
+        if not na(curH) and curH != prevH
+            f_addLevel(highArr, curH, true, tfText, col)
+            prevH := curH
+        if not na(curL) and curL != prevL
+            f_addLevel(lowArr, curL, false, tfText, col)
+            prevL := curL
+
+f_updateLevels(dH, dL, dHighArr, dLowArr, "D", col_daily, showDaily)
+f_updateLevels(h1H, h1L, h1HighArr, h1LowArr, "1H", col_1h, show1H)
+f_updateLevels(m15H, m15L, m15HighArr, m15LowArr, "15M", col_15, show15)
+f_updateLevels(m5H, m5L, m5HighArr, m5LowArr, "5M", col_5, show5)
+
+// ----------------------------------------------------------------------------------------------------
+// SWEEP DETECTION (Step 1 candidates) - runs on every 1-min bar against every stored level
+// ----------------------------------------------------------------------------------------------------
+f_processArr(arr, isHighSide, tfText) =>
+    ev = SweepEvent.new(happened = false, isHigh = false, level = na, tf = "")
+    n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            lvl = array.get(arr, i)
+            if not lvl.swept
+                line.set_x2(lvl.ln, bar_index)
+                if isHighSide
+                    if high > lvl.level and close < lvl.level
+                        lvl.swept := true
+                        if showSweptLevels
+                            line.set_color(lvl.ln, color.gray)
+                            line.set_style(lvl.ln, line.style_dashed)
+                            if not na(lvl.lbl)
+                                label.set_color(lvl.lbl, color.new(color.gray, 60))
+                                label.set_textcolor(lvl.lbl, color.gray)
+                        else
+                            line.delete(lvl.ln)
+                            label.delete(lvl.lbl)
+                        wickSize = high - lvl.level
+                        if wickSize >= minWickTicks * syminfo.mintick
+                            ev := SweepEvent.new(happened = true, isHigh = true, level = lvl.level, tf = tfText)
+                else
+                    if low < lvl.level and close > lvl.level
+                        lvl.swept := true
+                        if showSweptLevels
+                            line.set_color(lvl.ln, color.gray)
+                            line.set_style(lvl.ln, line.style_dashed)
+                            if not na(lvl.lbl)
+                                label.set_color(lvl.lbl, color.new(color.gray, 60))
+                                label.set_textcolor(lvl.lbl, color.gray)
+                        else
+                            line.delete(lvl.ln)
+                            label.delete(lvl.lbl)
+                        wickSize = lvl.level - low
+                        if wickSize >= minWickTicks * syminfo.mintick
+                            ev := SweepEvent.new(happened = true, isHigh = false, level = lvl.level, tf = tfText)
+    ev
+
+evDH  = f_processArr(dHighArr,  true,  "D")
+evDL  = f_processArr(dLowArr,   false, "D")
+ev1H  = f_processArr(h1HighArr, true,  "1H")
+ev1L  = f_processArr(h1LowArr,  false, "1H")
+ev15H = f_processArr(m15HighArr,true,  "15M")
+ev15L = f_processArr(m15LowArr, false, "15M")
+ev5H  = f_processArr(m5HighArr, true,  "5M")
+ev5L  = f_processArr(m5LowArr,  false, "5M")
+
+highSweptAny   = evDH.happened or ev1H.happened or ev15H.happened or ev5H.happened
+highSweptTF    = evDH.happened ? evDH.tf : ev1H.happened ? ev1H.tf : ev15H.happened ? ev15H.tf : ev5H.happened ? ev5H.tf : ""
+highSweptLevel = evDH.happened ? evDH.level : ev1H.happened ? ev1H.level : ev15H.happened ? ev15H.level : ev5H.happened ? ev5H.level : na
+
+lowSweptAny    = evDL.happened or ev1L.happened or ev15L.happened or ev5L.happened
+lowSweptTF     = evDL.happened ? evDL.tf : ev1L.happened ? ev1L.tf : ev15L.happened ? ev15L.tf : ev5L.happened ? ev5L.tf : ""
+lowSweptLevel  = evDL.happened ? evDL.level : ev1L.happened ? ev1L.level : ev15L.happened ? ev15L.level : ev5L.happened ? ev5L.level : na
+
+if showStep1 and highSweptAny
+    label.new(bar_index, high, text = highSweptTF + " Sweep", style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+if showStep1 and lowSweptAny
+    label.new(bar_index, low, text = lowSweptTF + " Sweep", style = label.style_label_up, color = color.new(color.green, 70), textcolor = color.white, size = size.tiny)
+
+// ----------------------------------------------------------------------------------------------------
+// SETUP ARM (Step 1 confirmed -> remember the 1-min sweep candle as "candle A")
+// ----------------------------------------------------------------------------------------------------
+f_clearSetupDrawings(s) =>
+    if not na(s.riskBox)
+        box.delete(s.riskBox)
+    if not na(s.rewardBox)
+        box.delete(s.rewardBox)
+    if not na(s.tp2Line)
+        line.delete(s.tp2Line)
+    if not na(s.tp3Line)
+        line.delete(s.tp3Line)
+    if not na(s.infoLbl)
+        label.delete(s.infoLbl)
+    if not na(s.tp2Lbl)
+        label.delete(s.tp2Lbl)
+    if not na(s.tp3Lbl)
+        label.delete(s.tp3Lbl)
+
+if highSweptAny and not shortSetup.active
+    f_clearSetupDrawings(shortSetup)
+    shortSetup.active          := true
+    shortSetup.candleAHigh     := high
+    shortSetup.candleALow      := low
+    shortSetup.candleABar      := bar_index
+    shortSetup.originTF        := highSweptTF
+    shortSetup.originLevel     := highSweptLevel
+    shortSetup.entryCount      := 0
+    shortSetup.awaitingReentry := false
+    shortSetup.riskBox := na
+    shortSetup.rewardBox := na
+    shortSetup.tp2Line := na
+    shortSetup.tp3Line := na
+    shortSetup.infoLbl := na
+    shortSetup.tp2Lbl := na
+    shortSetup.tp3Lbl := na
+
+if lowSweptAny and not longSetup.active
+    f_clearSetupDrawings(longSetup)
+    longSetup.active          := true
+    longSetup.candleAHigh     := high
+    longSetup.candleALow      := low
+    longSetup.candleABar      := bar_index
+    longSetup.originTF        := lowSweptTF
+    longSetup.originLevel     := lowSweptLevel
+    longSetup.entryCount      := 0
+    longSetup.awaitingReentry := false
+    longSetup.riskBox := na
+    longSetup.rewardBox := na
+    longSetup.tp2Line := na
+    longSetup.tp3Line := na
+    longSetup.infoLbl := na
+    longSetup.tp2Lbl := na
+    longSetup.tp3Lbl := na
+
+// timeout: drop a setup that never got its Step 2 confirmation
+if shortSetup.active and shortSetup.entryCount == 0 and not shortSetup.awaitingReentry and (bar_index - shortSetup.candleABar) > step2TimeoutBars
+    shortSetup.active := false
+if longSetup.active and longSetup.entryCount == 0 and not longSetup.awaitingReentry and (bar_index - longSetup.candleABar) > step2TimeoutBars
+    longSetup.active := false
+
+// ----------------------------------------------------------------------------------------------------
+// DRAW / UPDATE HELPERS FOR RISK-REWARD BOX
+// ----------------------------------------------------------------------------------------------------
+f_openTrade(s, entryPx, slPx, isShort) =>
+    riskDist = math.abs(slPx - entryPx)
+    s.entryPrice := entryPx
+    s.slPrice    := slPx
+    s.tp1        := isShort ? entryPx - riskDist * rr1 : entryPx + riskDist * rr1
+    s.tp2        := isShort ? entryPx - riskDist * rr2 : entryPx + riskDist * rr2
+    s.tp3        := isShort ? entryPx - riskDist * rr3 : entryPx + riskDist * rr3
+    s.entryCount += 1
+    s.awaitingReentry := false
+
+    f_clearSetupDrawings(s)
+    if showRRBox
+        s.riskBox   := box.new(left = bar_index, top = math.max(entryPx, slPx), bottom = math.min(entryPx, slPx), right = bar_index, bgcolor = color.new(color.red, 82), border_color = color.red, extend = extend.none)
+        s.rewardBox := box.new(left = bar_index, top = math.max(entryPx, s.tp1), bottom = math.min(entryPx, s.tp1), right = bar_index, bgcolor = color.new(color.green, 85), border_color = color.green, extend = extend.none)
+        s.tp2Line   := line.new(x1 = bar_index, y1 = s.tp2, x2 = bar_index, y2 = s.tp2, color = color.new(color.green, 30), style = line.style_dashed, width = 1)
+        s.tp3Line   := line.new(x1 = bar_index, y1 = s.tp3, x2 = bar_index, y2 = s.tp3, color = color.new(color.green, 10), style = line.style_dashed, width = 1)
+        s.tp2Lbl    := label.new(bar_index, s.tp2, "TP2 (" + str.tostring(rr2, "#.##") + "R) " + str.tostring(s.tp2, format.mintick), style = label.style_label_left, color = color.new(color.green, 90), textcolor = color.green, size = size.tiny)
+        s.tp3Lbl    := label.new(bar_index, s.tp3, "TP3 (" + str.tostring(rr3, "#.##") + "R) " + str.tostring(s.tp3, format.mintick), style = label.style_label_left, color = color.new(color.green, 90), textcolor = color.green, size = size.tiny)
+    if showStep2
+        dirTxt = isShort ? "SHORT" : "LONG"
+        s.infoLbl := label.new(bar_index, isShort ? high : low, text = dirTxt + " Entry " + str.tostring(s.entryCount) + "/" + str.tostring(maxReentries) + "\n" + s.originTF + " liq | SL " + str.tostring(slPx, format.mintick), style = isShort ? label.style_label_down : label.style_label_up, color = isShort ? color.new(color.red, 20) : color.new(color.green, 20), textcolor = color.white, size = size.small)
+
+f_extendTrade(s) =>
+    if not na(s.riskBox)
+        box.set_right(s.riskBox, bar_index)
+    if not na(s.rewardBox)
+        box.set_right(s.rewardBox, bar_index)
+    if not na(s.tp2Line)
+        line.set_x2(s.tp2Line, bar_index)
+    if not na(s.tp3Line)
+        line.set_x2(s.tp3Line, bar_index)
+
+// ----------------------------------------------------------------------------------------------------
+// SHORT SETUP MANAGEMENT (Step 2, entries, SL, TP)
+// ----------------------------------------------------------------------------------------------------
+if shortSetup.active and bar_index > shortSetup.candleABar
+    if shortSetup.entryCount == 0 and not shortSetup.awaitingReentry
+        // Step 2: this bar sweeps candle A's high and closes back below it
+        if high > shortSetup.candleAHigh and close < shortSetup.candleAHigh
+            slPx = high + slBufferTicks * syminfo.mintick
+            f_openTrade(shortSetup, close, slPx, true)
+    else if shortSetup.awaitingReentry
+        // automatic reentry on the very next 1-min candle after an SL hit
+        slPx = high + slBufferTicks * syminfo.mintick
+        f_openTrade(shortSetup, close, slPx, true)
+    else
+        // managing a live short
+        if high >= shortSetup.slPrice
+            if shortSetup.entryCount < maxReentries
+                shortSetup.awaitingReentry := true
+                if showStep2
+                    label.new(bar_index, high, "SL hit - reentry next candle (" + str.tostring(shortSetup.entryCount) + "/" + str.tostring(maxReentries) + " used)", style = label.style_label_down, color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+            else
+                shortSetup.active := false
+                if showStep2
+                    label.new(bar_index, high, "Max entries used - setup invalidated", style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+        else if low <= shortSetup.tp1
+            shortSetup.active := false
+            if showStep2
+                label.new(bar_index, low, "TP1 hit", style = label.style_label_up, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+        else
+            f_extendTrade(shortSetup)
+
+// ----------------------------------------------------------------------------------------------------
+// LONG SETUP MANAGEMENT (Step 2, entries, SL, TP)
+// ----------------------------------------------------------------------------------------------------
+if longSetup.active and bar_index > longSetup.candleABar
+    if longSetup.entryCount == 0 and not longSetup.awaitingReentry
+        // Step 2: this bar sweeps candle A's low and closes back above it
+        if low < longSetup.candleALow and close > longSetup.candleALow
+            slPx = low - slBufferTicks * syminfo.mintick
+            f_openTrade(longSetup, close, slPx, false)
+    else if longSetup.awaitingReentry
+        slPx = low - slBufferTicks * syminfo.mintick
+        f_openTrade(longSetup, close, slPx, false)
+    else
+        // managing a live long
+        if low <= longSetup.slPrice
+            if longSetup.entryCount < maxReentries
+                longSetup.awaitingReentry := true
+                if showStep2
+                    label.new(bar_index, low, "SL hit - reentry next candle (" + str.tostring(longSetup.entryCount) + "/" + str.tostring(maxReentries) + " used)", style = label.style_label_up, color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+            else
+                longSetup.active := false
+                if showStep2
+                    label.new(bar_index, low, "Max entries used - setup invalidated", style = label.style_label_up, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+        else if high >= longSetup.tp1
+            longSetup.active := false
+            if showStep2
+                label.new(bar_index, high, "TP1 hit", style = label.style_label_down, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+        else
+            f_extendTrade(longSetup)
+
+// ----------------------------------------------------------------------------------------------------
+// ALERTS
+// ----------------------------------------------------------------------------------------------------
+shortEntryFired = ta.change(shortSetup.entryCount) > 0
+longEntryFired  = ta.change(longSetup.entryCount) > 0
+
+alertcondition(highSweptAny or lowSweptAny, title = "HTF Liquidity Sweep", message = "1-min candle swept an HTF liquidity level")
+alertcondition(shortEntryFired, title = "Short Entry", message = "Short entry triggered")
+alertcondition(longEntryFired, title = "Long Entry", message = "Long entry triggered")
